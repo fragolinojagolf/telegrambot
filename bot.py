@@ -1,1130 +1,953 @@
 import os
-import re
 import sqlite3
 import threading
-from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
-Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-MessageHandler, filters,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = 5785266634
 DB_NAME = os.environ.get("BONUSBOT_DB", "bonusbot.db")
 
-# -------------------------------------------------
 
+# =========================
 # DATABASE
-
-# -------------------------------------------------
+# =========================
 
 def db():
-conn = sqlite3.connect(DB_NAME, timeout=15)
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA foreign_keys = ON")
-return conn
+    conn = sqlite3.connect(DB_NAME, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-with db() as c:
-c.executescript("""
-CREATE TABLE IF NOT EXISTS users (
-id INTEGER PRIMARY KEY,
-username TEXT,
-first_name TEXT,
-joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-referrer_id INTEGER
-);
+    conn = db()
+    cur = conn.cursor()
 
-```
-    CREATE TABLE IF NOT EXISTS progress (
-        user_id INTEGER PRIMARY KEY,
-        completed INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS support (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        message TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS bonuses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        amount TEXT NOT NULL DEFAULT '',
-        link TEXT NOT NULL DEFAULT '',
-        instructions TEXT NOT NULL DEFAULT '',
-        active INTEGER NOT NULL DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS completions (
-        user_id INTEGER NOT NULL,
-        bonus_id INTEGER NOT NULL,
-        completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, bonus_id),
-        FOREIGN KEY (bonus_id) REFERENCES bonuses(id) ON DELETE CASCADE
-    );
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
 
-    cols = {
-        row[1]
-        for row in c.execute("PRAGMA table_info(users)")
-    }
-
-    if "referrer_id" not in cols:
-        c.execute(
-            "ALTER TABLE users ADD COLUMN referrer_id INTEGER"
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bonuses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            active INTEGER DEFAULT 1
         )
+    """)
 
-    count = c.execute(
-        "SELECT COUNT(*) FROM bonuses"
-    ).fetchone()[0]
-
-    if not count:
-        c.execute(
-            """
-            INSERT INTO bonuses
-            (title, amount, link, instructions)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                "Bonus 80€",
-                "80 €",
-                "",
-                "Registrati dal link ufficiale, completa i requisiti della promozione e attendi l'erogazione secondo i termini."
-            )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS completions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            bonus_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
 
-    first_bonus = c.execute(
-        "SELECT id FROM bonuses ORDER BY id LIMIT 1"
-    ).fetchone()
-
-    if first_bonus:
-        c.execute(
-            """
-            INSERT OR IGNORE INTO completions(user_id, bonus_id)
-            SELECT user_id, ?
-            FROM progress
-            WHERE completed = 1
-            """,
-            (first_bonus["id"],)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-```
+    """)
 
-def save_user(user, referrer_id=None):
-if not user:
-return
+    conn.commit()
+    conn.close()
 
-```
-with db() as c:
-    row = c.execute(
-        "SELECT referrer_id FROM users WHERE id=?",
-        (user.id,)
-    ).fetchone()
 
-    ref = (
-        referrer_id
-        if referrer_id and referrer_id != user.id
-        else None
+def save_user(user):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO users (id, username, first_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name
+        """,
+        (user.id, user.username, user.first_name),
     )
+    conn.commit()
+    conn.close()
 
-    if row is None:
-        c.execute(
-            """
-            INSERT INTO users
-            (id, username, first_name, referrer_id)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                user.id,
-                user.username,
-                user.first_name or "",
-                ref
-            )
-        )
-    else:
-        # Manteniamo il referral originale.
-        c.execute(
-            """
-            UPDATE users
-            SET username=?, first_name=?
-            WHERE id=?
-            """,
-            (
-                user.username,
-                user.first_name or "",
-                user.id
-            )
-        )
-```
 
-# -------------------------------------------------
-
-# MENU
-
-# -------------------------------------------------
-
-def main_menu(uid):
-rows = [
-[
-InlineKeyboardButton(
-"🎁 Bonus disponibili",
-callback_data="bonus"
-)
-],
-[
-InlineKeyboardButton(
-"📋 Come funziona",
-callback_data="come_funziona"
-)
-],
-[
-InlineKeyboardButton(
-"✅ Ho completato",
-callback_data="completato"
-)
-],
-[
-InlineKeyboardButton(
-"🆘 Assistenza",
-callback_data="assistenza"
-)
-],
-[
-InlineKeyboardButton(
-"👥 Invita un amico",
-callback_data="invita"
-)
-],
-]
-
-```
-if uid == ADMIN_ID:
-    rows.append([
-        InlineKeyboardButton(
-            "👑 Pannello Admin",
-            callback_data="admin"
-        )
-    ])
-
-return InlineKeyboardMarkup(rows)
-```
-
-def admin_menu():
-return InlineKeyboardMarkup([
-[
-InlineKeyboardButton(
-"📊 Statistiche",
-callback_data="admin_stats"
-),
-InlineKeyboardButton(
-"🎁 Gestione bonus",
-callback_data="admin_bonus"
-)
-],
-[
-InlineKeyboardButton(
-"🔗 Statistiche referral",
-callback_data="admin_referrals"
-)
-],
-[
-InlineKeyboardButton(
-"👥 Utenti",
-callback_data="admin_users"
-),
-InlineKeyboardButton(
-"📩 Assistenza",
-callback_data="admin_support"
-)
-],
-[
-InlineKeyboardButton(
-"🏠 Menu",
-callback_data="menu"
-)
-],
-])
-
-def bonus_list_keyboard(rows, admin=False):
-buttons = []
-
-```
-for b in rows:
-    label = (
-        f"{'🟢' if b['active'] else '⚪'} "
-        f"{b['title']} · {b['amount']}"
-    )[:60]
-
-    buttons.append([
-        InlineKeyboardButton(
-            label,
-            callback_data=(
-                f"{'be' if admin else 'bv'}:{b['id']}"
-            )
-        )
-    ])
-
-if admin:
-    buttons.append([
-        InlineKeyboardButton(
-            "➕ Aggiungi bonus",
-            callback_data="ba"
-        )
-    ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Admin",
-            callback_data="admin"
-        )
-    ])
-else:
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Menu",
-            callback_data="menu"
-        )
-    ])
-
-return InlineKeyboardMarkup(buttons)
-```
-
-# -------------------------------------------------
-
-# MODIFICA SICURA DEI MESSAGGI
-
-# -------------------------------------------------
+# =========================
+# UTILITÀ
+# =========================
 
 async def safe_edit(query, text, reply_markup=None):
-"""
-Modifica il messaggio senza far fallire il bot
-quando il contenuto è già identico.
-"""
-
-```
-try:
-    await query.edit_message_text(
-        text,
-        reply_markup=reply_markup
-    )
-
-except BadRequest as e:
-    if "Message is not modified" in str(e):
-        return
-
-    raise
-```
-
-# -------------------------------------------------
-
-# COMANDI
-
-# -------------------------------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-user = update.effective_user
-
-```
-ref = None
-
-if context.args and context.args[0].startswith("ref_"):
     try:
-        ref = int(context.args[0][4:])
-    except ValueError:
-        pass
-
-save_user(user, ref)
-
-await update.message.reply_text(
-    f"👋 Ciao {escape(user.first_name or 'utente')}!\n\n"
-    "🎁 Benvenuto nel sistema bonus.\n\n"
-    "Scegli un'opzione dal menu:",
-    reply_markup=main_menu(user.id)
-)
-```
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(
-f"Il tuo ID Telegram è: {update.effective_user.id}"
-)
-
-# -------------------------------------------------
-
-# ADMIN
-
-# -------------------------------------------------
-
-async def prompt(update, context, stage, text):
-context.user_data["admin_stage"] = stage
-
-```
-await safe_edit(
-    update.callback_query,
-    text,
-    InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Annulla",
-                callback_data="admin_bonus"
-            )
-        ]
-    ])
-)
-```
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-user = update.effective_user
-
-```
-if not user or user.id != ADMIN_ID:
-    return
-
-stage = context.user_data.get("admin_stage")
-
-if not stage:
-    return
-
-value = (update.message.text or "").strip()
-
-if not value:
-    await update.message.reply_text(
-        "Il testo è vuoto. Riprova oppure annulla dal pannello."
-    )
-    return
-
-if len(value) > 3500:
-    await update.message.reply_text(
-        "Testo troppo lungo (massimo 3500 caratteri). Riprova."
-    )
-    return
-
-kind, _, raw_id = stage.partition(":")
-
-bonus_id = (
-    int(raw_id)
-    if raw_id.isdigit()
-    else None
-)
-
-if kind == "new_title":
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO bonuses(title) VALUES(?)",
-            (value,)
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup
         )
-        bonus_id = cur.lastrowid
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
 
-    context.user_data.pop("admin_stage", None)
 
-    await update.message.reply_text(
-        "Bonus creato. Ora puoi modificarne importo, link e istruzioni.",
-        reply_markup=bonus_admin_keyboard(bonus_id)
-    )
-    return
-
-fields = {
-    "title": "title",
-    "amount": "amount",
-    "link": "link",
-    "instructions": "instructions"
-}
-
-if kind not in fields or not bonus_id:
-    context.user_data.pop("admin_stage", None)
-
-    await update.message.reply_text(
-        "Modifica annullata: stato non valido."
-    )
-    return
-
-if (
-    kind == "link"
-    and value.lower() not in ("nessuno", "-", "rimuovi")
-    and not re.match(r"^https?://\S+$", value)
-):
-    await update.message.reply_text(
-        "Inserisci un link http/https completo, oppure scrivi 'nessuno'."
-    )
-    return
-
-if (
-    kind == "link"
-    and value.lower() in ("nessuno", "-", "rimuovi")
-):
-    value = ""
-
-with db() as c:
-    c.execute(
-        f"UPDATE bonuses SET {fields[kind]}=? WHERE id=?",
-        (value, bonus_id)
-    )
-
-context.user_data.pop("admin_stage", None)
-
-await update.message.reply_text(
-    "✅ Bonus aggiornato.",
-    reply_markup=bonus_admin_keyboard(bonus_id)
-)
-```
-
-def bonus_admin_keyboard(bid):
-return InlineKeyboardMarkup([
-[
-InlineKeyboardButton(
-"✏️ Nome",
-callback_data=f"bf:title:{bid}"
-),
-InlineKeyboardButton(
-"💰 Importo",
-callback_data=f"bf:amount:{bid}"
-)
-],
-[
-InlineKeyboardButton(
-"🔗 Link",
-callback_data=f"bf:link:{bid}"
-),
-InlineKeyboardButton(
-"📋 Istruzioni",
-callback_data=f"bf:instructions:{bid}"
-)
-],
-[
-InlineKeyboardButton(
-"🟢/⚪ Attiva o disattiva",
-callback_data=f"bt:{bid}"
-)
-],
-[
-InlineKeyboardButton(
-"🗑️ Elimina",
-callback_data=f"bd:{bid}"
-)
-],
-[
-InlineKeyboardButton(
-"⬅️ Lista bonus",
-callback_data="admin_bonus"
-)
-],
-])
-
-# -------------------------------------------------
-
-# CALLBACK
-
-# -------------------------------------------------
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-
-```
-await q.answer()
-
-user = q.from_user
-save_user(user)
-
-data = q.data or ""
-
-if (
-    data.startswith("admin")
-    or data in ("admin", "ba")
-    or data.startswith(("be:", "bf:", "bt:", "bd:", "bdel:"))
-):
-    if user.id != ADMIN_ID:
-        return
-
-if data == "menu":
-
-    context.user_data.pop("selected_bonus", None)
-
-    await safe_edit(
-        q,
-        "🏠 MENU PRINCIPALE",
-        main_menu(user.id)
-    )
-
-elif data == "bonus":
-
-    with db() as c:
-        rows = c.execute(
-            "SELECT * FROM bonuses WHERE active=1 ORDER BY id"
-        ).fetchall()
-
-    await safe_edit(
-        q,
-        "🎁 BONUS DISPONIBILI\nScegli una promozione:",
-        bonus_list_keyboard(rows)
-    )
-
-elif data.startswith("bv:"):
-
-    bid = int(data.split(":")[1])
-
-    with db() as c:
-        b = c.execute(
-            """
-            SELECT *
-            FROM bonuses
-            WHERE id=? AND active=1
-            """,
-            (bid,)
-        ).fetchone()
-
-    if not b:
-        await safe_edit(
-            q,
-            "Questo bonus non è più disponibile.",
-            main_menu(user.id)
-        )
-        return
-
-    context.user_data["selected_bonus"] = bid
-
-    buttons = []
-
-    if b["link"]:
-        buttons.append([
-            InlineKeyboardButton(
-                "🔗 Apri link",
-                url=b["link"]
-            )
-        ])
-
-    buttons += [
-        [
-            InlineKeyboardButton(
-                "✅ Ho completato",
-                callback_data="completato"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Bonus",
-                callback_data="bonus"
-            )
-        ]
+def main_keyboard(user_id):
+    buttons = [
+        [InlineKeyboardButton("🎁 Bonus disponibili", callback_data="bonus")],
+        [InlineKeyboardButton("📋 Come funziona", callback_data="come_funziona")],
+        [InlineKeyboardButton("✅ Ho completato", callback_data="completato")],
+        [InlineKeyboardButton("🆘 Assistenza", callback_data="assistenza")],
+        [InlineKeyboardButton("👥 Invita un amico", callback_data="invita")],
     ]
 
-    await safe_edit(
-        q,
-        (
-            f"🎁 {b['title']} · {b['amount']}\n\n"
-            f"{b['instructions'] or 'Segui le istruzioni della promozione.'}"
-        ),
-        InlineKeyboardMarkup(buttons)
-    )
-
-elif data == "come_funziona":
-
-    await safe_edit(
-        q,
-        "📋 Scegli un bonus, segui le istruzioni e segnalo come completato quando hai finito.",
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🎁 Bonus",
-                    callback_data="bonus"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Menu",
-                    callback_data="menu"
-                )
-            ]
+    if user_id == ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton("👑 Pannello Admin", callback_data="admin")
         ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Statistiche", callback_data="admin_stats")],
+        [InlineKeyboardButton("🎁 Gestione bonus", callback_data="admin_bonus")],
+        [InlineKeyboardButton("🔗 Referral", callback_data="admin_referrals")],
+        [InlineKeyboardButton("👥 Utenti", callback_data="admin_users")],
+        [InlineKeyboardButton("🏠 Menu", callback_data="menu")],
+    ])
+
+
+def bonus_keyboard(bonuses):
+    buttons = []
+
+    for bonus in bonuses:
+        buttons.append([
+            InlineKeyboardButton(
+                f"🎁 {bonus['name']} — {bonus['amount']}",
+                callback_data=f"bonus_{bonus['id']}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton("🏠 Menu", callback_data="menu")
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# =========================
+# START
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    # Referral
+    if context.args:
+        arg = context.args[0]
+
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg.replace("ref_", ""))
+
+                if referrer_id != user.id:
+                    conn = db()
+
+                    existing = conn.execute(
+                        "SELECT id FROM referrals WHERE referred_id = ?",
+                        (user.id,)
+                    ).fetchone()
+
+                    if not existing:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO referrals
+                            (referrer_id, referred_id)
+                            VALUES (?, ?)
+                            """,
+                            (referrer_id, user.id)
+                        )
+                        conn.commit()
+
+                    conn.close()
+
+            except ValueError:
+                pass
+
+    text = (
+        f"👋 Ciao {user.first_name}!\n\n"
+        "🎁 Benvenuto nel nostro sistema bonus.\n\n"
+        "Da qui puoi vedere le promozioni disponibili, "
+        "iniziare una procedura e ricevere assistenza."
     )
 
-elif data == "completato":
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(user.id)
+    )
 
-    bid = context.user_data.get("selected_bonus")
 
-    if not bid:
-        with db() as c:
-            row = c.execute(
-                """
-                SELECT id
-                FROM bonuses
-                WHERE active=1
-                ORDER BY id
-                LIMIT 1
-                """
-            ).fetchone()
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆔 Il tuo ID Telegram è:\n\n{update.effective_user.id}"
+    )
 
-        bid = row["id"] if row else None
 
-    if not bid:
+# =========================
+# CALLBACK
+# =========================
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    save_user(user)
+
+    data = query.data
+
+    # MENU
+    if data == "menu":
         await safe_edit(
-            q,
-            "Al momento non ci sono bonus disponibili.",
-            main_menu(user.id)
+            query,
+            (
+                f"👋 Ciao {user.first_name}!\n\n"
+                "🎁 Benvenuto nel nostro sistema bonus.\n\n"
+                "Scegli un'opzione:"
+            ),
+            main_keyboard(user.id)
         )
         return
 
-    with db() as c:
+    # BONUS
+    if data == "bonus":
+        conn = db()
+        bonuses = conn.execute(
+            "SELECT * FROM bonuses WHERE active = 1 ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
 
-        cur = c.execute(
-            """
-            INSERT OR IGNORE INTO completions
-            (user_id, bonus_id)
-            VALUES (?, ?)
-            """,
-            (user.id, bid)
+        if not bonuses:
+            await safe_edit(
+                query,
+                "😔 Al momento non ci sono bonus disponibili.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
+                ])
+            )
+            return
+
+        await safe_edit(
+            query,
+            "🎁 **Bonus disponibili**\n\nScegli una promozione:",
+            bonus_keyboard(bonuses)
+        )
+        return
+
+    # DETTAGLIO BONUS
+    if data.startswith("bonus_"):
+        try:
+            bonus_id = int(data.split("_")[1])
+        except ValueError:
+            return
+
+        conn = db()
+        bonus = conn.execute(
+            "SELECT * FROM bonuses WHERE id = ? AND active = 1",
+            (bonus_id,)
+        ).fetchone()
+        conn.close()
+
+        if not bonus:
+            await safe_edit(
+                query,
+                "❌ Questo bonus non è più disponibile.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🎁 Torna ai bonus",
+                        callback_data="bonus"
+                    )]
+                ])
+            )
+            return
+
+        text = (
+            f"🎁 **{bonus['name']}**\n\n"
+            f"💰 Bonus: **{bonus['amount']}**\n\n"
+            f"ℹ️ {bonus['description']}\n\n"
+            "Quando hai completato la procedura, premi "
+            "«Ho completato»."
         )
 
-        first_time = cur.rowcount == 1
-
-        c.execute(
-            """
-            INSERT INTO progress(user_id, completed)
-            VALUES (?, 1)
-            ON CONFLICT(user_id)
-            DO UPDATE SET completed=1
-            """,
-            (user.id,)
+        await safe_edit(
+            query,
+            text,
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ Ho completato",
+                    callback_data=f"done_{bonus_id}"
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Torna ai bonus",
+                    callback_data="bonus"
+                )],
+            ])
         )
+        return
 
-        b = c.execute(
-            "SELECT title FROM bonuses WHERE id=?",
-            (bid,)
+    # COMPLETATO
+    if data == "completato":
+        conn = db()
+        bonuses = conn.execute(
+            "SELECT * FROM bonuses WHERE active = 1 ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
+
+        if not bonuses:
+            await safe_edit(
+                query,
+                "Non ci sono bonus disponibili.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
+                ])
+            )
+            return
+
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"✅ {b['name']}",
+                    callback_data=f"done_{b['id']}"
+                )
+            ]
+            for b in bonuses
+        ]
+
+        buttons.append([
+            InlineKeyboardButton("🏠 Menu", callback_data="menu")
+        ])
+
+        await safe_edit(
+            query,
+            "✅ Seleziona il bonus che hai completato:",
+            InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # CONFERMA COMPLETAMENTO
+    if data.startswith("done_"):
+        try:
+            bonus_id = int(data.split("_")[1])
+        except ValueError:
+            return
+
+        conn = db()
+
+        bonus = conn.execute(
+            "SELECT * FROM bonuses WHERE id = ?",
+            (bonus_id,)
         ).fetchone()
 
-        ref = c.execute(
-            "SELECT referrer_id FROM users WHERE id=?",
-            (user.id,)
-        ).fetchone()
+        if bonus:
+            conn.execute(
+                """
+                INSERT INTO completions (user_id, bonus_id)
+                VALUES (?, ?)
+                """,
+                (user.id, bonus_id)
+            )
+            conn.commit()
 
-    if first_time:
+        conn.close()
+
+        await safe_edit(
+            query,
+            (
+                "✅ **Segnalazione ricevuta!**\n\n"
+                "Abbiamo registrato che hai completato la procedura.\n"
+                "L'amministratore potrà verificare la richiesta."
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
+            ])
+        )
 
         try:
             await context.bot.send_message(
                 ADMIN_ID,
                 (
-                    "✅ Procedura completata\n"
-                    f"👤 {user.first_name or 'utente'} "
-                    f"(ID {user.id})\n"
-                    f"🎁 {b['title'] if b else 'Bonus'}\n"
-                    f"🔗 Referral di: "
-                    f"{ref['referrer_id'] if ref and ref['referrer_id'] else 'nessuno'}"
+                    "🔔 **Nuovo completamento!**\n\n"
+                    f"👤 {user.first_name}\n"
+                    f"🆔 `{user.id}`\n"
+                    f"🎁 {bonus['name'] if bonus else 'Bonus'}"
                 )
             )
         except Exception:
             pass
 
-    await safe_edit(
-        q,
-        "✅ Completamento registrato.",
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
+        return
+
+    # COME FUNZIONA
+    if data == "come_funziona":
+        await safe_edit(
+            query,
+            (
+                "📋 **Come funziona**\n\n"
+                "1️⃣ Scegli uno dei bonus disponibili.\n\n"
+                "2️⃣ Segui le istruzioni indicate.\n\n"
+                "3️⃣ Completa la procedura richiesta.\n\n"
+                "4️⃣ Premi «Ho completato» per segnalare "
+                "la conclusione.\n\n"
+                "5️⃣ Attendi la verifica."
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🎁 Vedi i bonus",
+                    callback_data="bonus"
+                )],
+                [InlineKeyboardButton(
                     "🏠 Menu",
                     callback_data="menu"
-                )
-            ]
-        ])
-    )
+                )]
+            ])
+        )
+        return
 
-elif data == "invita":
+    # ASSISTENZA
+    if data == "assistenza":
+        await safe_edit(
+            query,
+            (
+                "🆘 **Assistenza**\n\n"
+                "Se hai bisogno di aiuto, scrivi qui il tuo problema "
+                "in un messaggio.\n\n"
+                "Un amministratore potrà aiutarti."
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
+            ])
+        )
+        context.user_data["support_mode"] = True
+        return
 
-    me = await context.bot.get_me()
+    # INVITA
+    if data == "invita":
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{user.id}"
 
-    link = (
-        f"https://t.me/{me.username}"
-        f"?start=ref_{user.id}"
-    )
+        await safe_edit(
+            query,
+            (
+                "👥 **Invita un amico**\n\n"
+                "Condividi questo link con un amico:\n\n"
+                f"`{link}`\n\n"
+                "Quando si registra tramite il tuo link, "
+                "il referral viene registrato."
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
+            ])
+        )
+        return
 
-    await safe_edit(
-        q,
-        (
-            "👥 Condividi il tuo link personale:\n\n"
-            f"{link}\n\n"
-            "Gli amici verranno associati al tuo profilo."
-        ),
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Menu",
-                    callback_data="menu"
-                )
-            ]
-        ])
-    )
+    # ADMIN
+    if data == "admin":
+        if user.id != ADMIN_ID:
+            return
 
-elif data == "assistenza":
+        await safe_edit(
+            query,
+            "👑 **Pannello Admin**\n\nScegli un'opzione:",
+            admin_keyboard()
+        )
+        return
 
-    await safe_edit(
-        q,
-        "🆘 Per assistenza, scrivi la tua richiesta qui.",
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Menu",
-                    callback_data="menu"
-                )
-            ]
-        ])
-    )
+    # STATISTICHE
+    if data == "admin_stats":
+        if user.id != ADMIN_ID:
+            return
 
-elif data == "admin":
+        conn = db()
 
-    await safe_edit(
-        q,
-        "👑 PANNELLO AMMINISTRATORE",
-        admin_menu()
-    )
+        users = conn.execute(
+            "SELECT COUNT(*) AS c FROM users"
+        ).fetchone()["c"]
 
-elif data == "admin_stats":
+        completions = conn.execute(
+            "SELECT COUNT(*) AS c FROM completions"
+        ).fetchone()["c"]
 
-    with db() as c:
-        users = c.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+        referrals = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals"
+        ).fetchone()["c"]
 
-        done = c.execute(
-            "SELECT COUNT(*) FROM completions"
-        ).fetchone()[0]
+        bonuses = conn.execute(
+            "SELECT COUNT(*) AS c FROM bonuses WHERE active = 1"
+        ).fetchone()["c"]
 
-        refs = c.execute(
-            """
-            SELECT COUNT(*)
-            FROM users
-            WHERE referrer_id IS NOT NULL
-            """
-        ).fetchone()[0]
+        conn.close()
 
-    await safe_edit(
-        q,
-        (
-            "📊 STATISTICHE\n\n"
-            f"👥 Utenti: {users}\n"
-            f"✅ Completamenti: {done}\n"
-            f"🔗 Utenti da referral: {refs}"
-        ),
-        admin_menu()
-    )
+        await safe_edit(
+            query,
+            (
+                "📊 **Statistiche**\n\n"
+                f"👥 Utenti: **{users}**\n"
+                f"🎁 Bonus attivi: **{bonuses}**\n"
+                f"✅ Completamenti: **{completions}**\n"
+                f"🔗 Referral: **{referrals}**"
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⬅️ Admin",
+                    callback_data="admin"
+                )]
+            ])
+        )
+        return
 
-elif data == "admin_referrals":
+    # REFERRAL ADMIN
+    if data == "admin_referrals":
+        if user.id != ADMIN_ID:
+            return
 
-    with db() as c:
-        rows = c.execute(
-            """
-            SELECT referrer_id, COUNT(*) AS n
-            FROM users
-            WHERE referrer_id IS NOT NULL
+        conn = db()
+
+        rows = conn.execute("""
+            SELECT referrer_id, COUNT(*) AS total
+            FROM referrals
             GROUP BY referrer_id
-            ORDER BY n DESC
+            ORDER BY total DESC
             LIMIT 20
-            """
-        ).fetchall()
+        """).fetchall()
 
-        entries = []
+        conn.close()
 
-        for r in rows:
-            done = c.execute(
-                """
-                SELECT COUNT(*)
-                FROM completions x
-                JOIN users y ON y.id=x.user_id
-                WHERE y.referrer_id=?
-                """,
-                (r["referrer_id"],)
-            ).fetchone()[0]
+        if not rows:
+            text = "🔗 **Referral**\n\nNessun referral registrato."
+        else:
+            text = "🔗 **Referral**\n\n"
 
-            entries.append(
-                f"ID {r['referrer_id']}: "
-                f"{r['n']} iscritti, "
-                f"{done} completamenti"
-            )
+            for row in rows:
+                text += (
+                    f"🆔 {row['referrer_id']} → "
+                    f"**{row['total']}**\n"
+                )
 
-    text = (
-        "🔗 REFERRAL (massimo 20)\n\n"
-        + (
-            "\n".join(entries)
-            if entries
-            else "Nessun referral registrato."
+        await safe_edit(
+            query,
+            text,
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⬅️ Admin",
+                    callback_data="admin"
+                )]
+            ])
         )
-    )
+        return
 
-    await safe_edit(
-        q,
-        text[:4000],
-        admin_menu()
-    )
+    # UTENTI
+    if data == "admin_users":
+        if user.id != ADMIN_ID:
+            return
 
-elif data == "admin_users":
+        conn = db()
 
-    with db() as c:
-        rows = c.execute(
-            """
-            SELECT id, first_name, username
-            FROM users
-            ORDER BY joined_at DESC
-            LIMIT 10
-            """
-        ).fetchall()
+        users = conn.execute("""
+            SELECT * FROM users
+            ORDER BY created_at DESC
+            LIMIT 20
+        """).fetchall()
 
-    text = (
-        "👥 ULTIMI UTENTI\n\n"
-        + (
-            "\n".join(
-                f"{r['first_name']} "
-                f"(@{r['username'] or 'nessuno'}) "
-                f"· {r['id']}"
-                for r in rows
-            )
-            if rows
-            else "Nessun utente."
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM users"
+        ).fetchone()["c"]
+
+        conn.close()
+
+        text = f"👥 **Utenti** — Totale: {total}\n\n"
+
+        for u in users:
+            username = f"@{u['username']}" if u["username"] else "senza username"
+            text += f"• {u['first_name']} — {username} — `{u['id']}`\n"
+
+        await safe_edit(
+            query,
+            text,
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⬅️ Admin",
+                    callback_data="admin"
+                )]
+            ])
         )
-    )
+        return
 
-    await safe_edit(
-        q,
-        text,
-        admin_menu()
-    )
+    # GESTIONE BONUS
+    if data == "admin_bonus":
+        if user.id != ADMIN_ID:
+            return
 
-elif data == "admin_support":
-
-    with db() as c:
-        n = c.execute(
-            "SELECT COUNT(*) FROM support"
-        ).fetchone()[0]
-
-    await safe_edit(
-        q,
-        f"📩 Richieste registrate: {n}",
-        admin_menu()
-    )
-
-elif data == "admin_bonus":
-
-    with db() as c:
-        rows = c.execute(
-            "SELECT * FROM bonuses ORDER BY id"
+        conn = db()
+        bonuses = conn.execute(
+            "SELECT * FROM bonuses ORDER BY id DESC"
         ).fetchall()
+        conn.close()
 
-    await safe_edit(
-        q,
-        "🎁 GESTIONE BONUS\nScegli un bonus da modificare:",
-        bonus_list_keyboard(rows, True)
-    )
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"{'🟢' if b['active'] else '🔴'} {b['name']}",
+                    callback_data=f"admin_bonus_view_{b['id']}"
+                )
+            ]
+            for b in bonuses
+        ]
 
-elif data == "ba":
+        buttons.append([
+            InlineKeyboardButton(
+                "➕ Aggiungi bonus",
+                callback_data="admin_add_bonus"
+            )
+        ])
 
-    await prompt(
-        update,
-        context,
-        "new_title",
-        "Invia il nome del nuovo bonus."
-    )
+        buttons.append([
+            InlineKeyboardButton(
+                "⬅️ Admin",
+                callback_data="admin"
+            )
+        ])
 
-elif data.startswith("be:"):
+        await safe_edit(
+            query,
+            "🎁 **Gestione bonus**\n\nSeleziona un bonus:",
+            InlineKeyboardMarkup(buttons)
+        )
+        return
 
-    bid = int(data.split(":")[1])
+    # VISUALIZZA BONUS ADMIN
+    if data.startswith("admin_bonus_view_"):
+        if user.id != ADMIN_ID:
+            return
 
-    with db() as c:
-        b = c.execute(
-            "SELECT * FROM bonuses WHERE id=?",
-            (bid,)
+        try:
+            bonus_id = int(data.split("_")[-1])
+        except ValueError:
+            return
+
+        conn = db()
+        bonus = conn.execute(
+            "SELECT * FROM bonuses WHERE id = ?",
+            (bonus_id,)
+        ).fetchone()
+        conn.close()
+
+        if not bonus:
+            return
+
+        status = "🟢 Attivo" if bonus["active"] else "🔴 Disattivato"
+
+        await safe_edit(
+            query,
+            (
+                f"🎁 **{bonus['name']}**\n\n"
+                f"💰 {bonus['amount']}\n\n"
+                f"📝 {bonus['description']}\n\n"
+                f"Stato: {status}"
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔄 Attiva/Disattiva",
+                    callback_data=f"toggle_{bonus_id}"
+                )],
+                [InlineKeyboardButton(
+                    "🗑 Elimina",
+                    callback_data=f"delete_{bonus_id}"
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Torna ai bonus",
+                    callback_data="admin_bonus"
+                )]
+            ])
+        )
+        return
+
+    # TOGGLE
+    if data.startswith("toggle_"):
+        if user.id != ADMIN_ID:
+            return
+
+        try:
+            bonus_id = int(data.split("_")[1])
+        except ValueError:
+            return
+
+        conn = db()
+
+        bonus = conn.execute(
+            "SELECT active FROM bonuses WHERE id = ?",
+            (bonus_id,)
         ).fetchone()
 
-    if b:
+        if bonus:
+            conn.execute(
+                "UPDATE bonuses SET active = ? WHERE id = ?",
+                (0 if bonus["active"] else 1, bonus_id)
+            )
+            conn.commit()
+
+        conn.close()
+
         await safe_edit(
-            q,
-            (
-                f"🎁 {b['title']} · {b['amount']}\n"
-                f"Stato: {'attivo' if b['active'] else 'disattivo'}\n"
-                f"Link: {b['link'] or 'nessuno'}\n\n"
-                f"{b['instructions'][:800]}"
-            ),
-            bonus_admin_keyboard(bid)
-        )
-
-elif data.startswith("bf:"):
-
-    _, kind, raw_id = data.split(":")
-
-    labels = {
-        "title": "nome",
-        "amount": "importo",
-        "link": "link http/https (o 'nessuno')",
-        "instructions": "istruzioni"
-    }
-
-    if kind in labels:
-        await prompt(
-            update,
-            context,
-            f"{kind}:{raw_id}",
-            f"Invia il nuovo {labels[kind]} del bonus."
-        )
-
-elif data.startswith("bt:"):
-
-    bid = int(data.split(":")[1])
-
-    with db() as c:
-        c.execute(
-            """
-            UPDATE bonuses
-            SET active=1-active
-            WHERE id=?
-            """,
-            (bid,)
-        )
-
-    await safe_edit(
-        q,
-        "Stato del bonus aggiornato.",
-        bonus_admin_keyboard(bid)
-    )
-
-elif data.startswith("bd:"):
-
-    bid = int(data.split(":")[1])
-
-    await safe_edit(
-        q,
-        "Eliminare questo bonus e i suoi completamenti?",
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "Conferma eliminazione",
-                    callback_data=f"bdel:{bid}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Annulla",
-                    callback_data=f"be:{bid}"
-                )
-            ]
-        ])
-    )
-
-elif data.startswith("bdel:"):
-
-    bid = int(data.split(":")[1])
-
-    with db() as c:
-        c.execute(
-            "DELETE FROM completions WHERE bonus_id=?",
-            (bid,)
-        )
-
-        c.execute(
-            "DELETE FROM bonuses WHERE id=?",
-            (bid,)
-        )
-
-    await safe_edit(
-        q,
-        "Bonus eliminato.",
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🎁 Gestione bonus",
+            query,
+            "✅ Stato del bonus aggiornato.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⬅️ Gestione bonus",
                     callback_data="admin_bonus"
+                )]
+            ])
+        )
+        return
+
+    # DELETE
+    if data.startswith("delete_"):
+        if user.id != ADMIN_ID:
+            return
+
+        try:
+            bonus_id = int(data.split("_")[1])
+        except ValueError:
+            return
+
+        conn = db()
+        conn.execute(
+            "DELETE FROM bonuses WHERE id = ?",
+            (bonus_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        await safe_edit(
+            query,
+            "🗑 Bonus eliminato.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⬅️ Gestione bonus",
+                    callback_data="admin_bonus"
+                )]
+            ])
+        )
+        return
+
+    # AGGIUNGI BONUS
+    if data == "admin_add_bonus":
+        if user.id != ADMIN_ID:
+            return
+
+        context.user_data["admin_state"] = "bonus_name"
+
+        await safe_edit(
+            query,
+            (
+                "➕ **Nuovo bonus**\n\n"
+                "Scrivi il **nome** del bonus."
+            ),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "❌ Annulla",
+                    callback_data="admin_bonus"
+                )]
+            ])
+        )
+        return
+
+
+# =========================
+# MESSAGGI TESTUALI
+# =========================
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    text = update.message.text.strip()
+
+    # Creazione bonus admin
+    if user.id == ADMIN_ID and context.user_data.get("admin_state"):
+        state = context.user_data["admin_state"]
+
+        if state == "bonus_name":
+            context.user_data["bonus_name"] = text
+            context.user_data["admin_state"] = "bonus_amount"
+
+            await update.message.reply_text(
+                "💰 Ora scrivi l'importo del bonus.\n\n"
+                "Esempio: `80€`"
+            )
+            return
+
+        if state == "bonus_amount":
+            context.user_data["bonus_amount"] = text
+            context.user_data["admin_state"] = "bonus_description"
+
+            await update.message.reply_text(
+                "📝 Ora scrivi la descrizione del bonus."
+            )
+            return
+
+        if state == "bonus_description":
+            name = context.user_data["bonus_name"]
+            amount = context.user_data["bonus_amount"]
+
+            conn = db()
+            conn.execute(
+                """
+                INSERT INTO bonuses (name, description, amount, active)
+                VALUES (?, ?, ?, 1)
+                """,
+                (name, text, amount)
+            )
+            conn.commit()
+            conn.close()
+
+            context.user_data.pop("admin_state", None)
+            context.user_data.pop("bonus_name", None)
+            context.user_data.pop("bonus_amount", None)
+
+            await update.message.reply_text(
+                "✅ **Bonus creato correttamente!**",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🎁 Gestione bonus",
+                        callback_data="admin_bonus"
+                    )],
+                    [InlineKeyboardButton(
+                        "🏠 Menu",
+                        callback_data="menu"
+                    )]
+                ])
+            )
+            return
+
+    # ASSISTENZA
+    if context.user_data.get("support_mode"):
+        context.user_data["support_mode"] = False
+
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                (
+                    "🆘 **Nuova richiesta di assistenza**\n\n"
+                    f"👤 {user.first_name}\n"
+                    f"🆔 `{user.id}`\n"
+                    f"💬 {text}"
                 )
-            ]
-        ])
+            )
+
+            await update.message.reply_text(
+                "✅ Messaggio inviato all'amministratore.\n\n"
+                "Ti risponderà appena possibile.",
+                reply_markup=main_keyboard(user.id)
+            )
+
+        except Exception:
+            await update.message.reply_text(
+                "❌ Non è stato possibile inviare il messaggio.",
+                reply_markup=main_keyboard(user.id)
+            )
+
+        return
+
+    await update.message.reply_text(
+        "Usa il menu qui sotto per scegliere un'opzione.",
+        reply_markup=main_keyboard(user.id)
     )
-```
 
-# -------------------------------------------------
 
-# RENDER HEALTH SERVER
-
-# -------------------------------------------------
+# =========================
+# HEALTH SERVER RENDER
+# =========================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-```
-def do_GET(self):
-    self.send_response(200)
-    self.send_header("Content-Type", "text/plain")
-    self.end_headers()
-    self.wfile.write(b"BonusBot OK")
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"BonusBot OK")
 
-def log_message(self, format, *args):
-    return
-```
+    def log_message(self, format, *args):
+        return
+
 
 def start_health_server():
-port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", "10000"))
 
-```
-server = HTTPServer(
-    ("0.0.0.0", port),
-    HealthHandler
-)
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
 
-print(f"Health server attivo sulla porta {port}")
+    print(f"Health server attivo sulla porta {port}")
+    server.serve_forever()
 
-server.serve_forever()
-```
 
-# -------------------------------------------------
-
+# =========================
 # AVVIO
-
-# -------------------------------------------------
+# =========================
 
 def main():
 
-```
-if not TOKEN or TOKEN == "INSERISCI_TOKEN":
-    raise RuntimeError(
-        "Token Telegram non configurato."
+    if not TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN non impostato."
+        )
+
+    init_db()
+
+    threading.Thread(
+        target=start_health_server,
+        daemon=True
+    ).start()
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
+
+    app.add_handler(
+        CallbackQueryHandler(callback)
     )
 
-init_db()
-
-# Server HTTP per Render
-threading.Thread(
-    target=start_health_server,
-    daemon=True
-).start()
-
-app = (
-    Application
-    .builder()
-    .token(TOKEN)
-    .build()
-)
-
-app.add_handler(
-    CommandHandler("start", start)
-)
-
-app.add_handler(
-    CommandHandler("myid", myid)
-)
-
-app.add_handler(
-    CallbackQueryHandler(callback)
-)
-
-app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        text_handler
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler
+        )
     )
-)
 
-print("BonusBot avviato")
+    print("BonusBot avviato")
 
-app.run_polling()
-```
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
-if **name** == "**main**":
-main()
 
+if __name__ == "__main__":
+    main()
