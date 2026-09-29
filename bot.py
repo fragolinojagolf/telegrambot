@@ -429,33 +429,32 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ASSISTENZA
-if data == "assistenza":
-    await safe_edit(
-        query,
-        (
-            "🆘 **Assistenza**\n\n"
-            "Hai bisogno di aiuto?\n\n"
-            "Premi il pulsante qui sotto per contattare "
-            "direttamente l'assistenza in privato."
-        ),
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "💬 Contattami in privato",
-                    url="https://t.me/cannavaro_as"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 Menu",
-                    callback_data="menu"
-                )
-            ]
-        ])
-    )
-    return
-
+    # ASSISTENZA 
+           if data == "assistenza":
+                await safe_edit(
+            query,
+            (
+                "🆘 **Assistenza**\n\n"
+                "Hai bisogno di aiuto?\n\n"
+                "Premi il pulsante qui sotto per contattare "
+                "direttamente l'assistenza in privato."
+            ),
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💬 Contattami in privato",
+                        url="https://t.me/cannavaro_as"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Menu",
+                        callback_data="menu"
+                    )
+                ]
+            ])
+        )
+        return
     # ADMIN
     if data == "admin":
         if user.id != ADMIN_ID:
