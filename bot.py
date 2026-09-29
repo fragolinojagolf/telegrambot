@@ -430,41 +430,31 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ASSISTENZA
-    if data == "assistenza":
-        await safe_edit(
-            query,
-            (
-                "🆘 **Assistenza**\n\n"
-                "Se hai bisogno di aiuto, scrivi qui il tuo problema "
-                "in un messaggio.\n\n"
-                "Un amministratore potrà aiutarti."
-            ),
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
-            ])
-        )
-        context.user_data["support_mode"] = True
-        return
-
-    # INVITA
-    if data == "invita":
-        me = await context.bot.get_me()
-        link = f"https://t.me/{me.username}?start=ref_{user.id}"
-
-        await safe_edit(
-            query,
-            (
-                "👥 **Invita un amico**\n\n"
-                "Condividi questo link con un amico:\n\n"
-                f"`{link}`\n\n"
-                "Quando si registra tramite il tuo link, "
-                "il referral viene registrato."
-            ),
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Menu", callback_data="menu")]
-            ])
-        )
-        return
+if data == "assistenza":
+    await safe_edit(
+        query,
+        (
+            "🆘 **Assistenza**\n\n"
+            "Hai bisogno di aiuto?\n\n"
+            "Premi il pulsante qui sotto per contattare "
+            "direttamente l'assistenza in privato."
+        ),
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💬 Contattami in privato",
+                    url="https://t.me/cannavaro_as"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Menu",
+                    callback_data="menu"
+                )
+            ]
+        ])
+    )
+    return
 
     # ADMIN
     if data == "admin":
